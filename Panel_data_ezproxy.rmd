@@ -1,0 +1,338 @@
+---
+title: "Analysis_Panel_EZProxy"
+author: "Nick Paulson"
+date: "2/28/2019"
+output:
+  html_document: default
+  word_document: default
+---
+
+---
+title: "Longitudinal EZProxy models"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#Load required packages
+library(reticulate)
+library(zoo)
+library(tidyverse)
+library(broom)
+library(margins)
+library(xtable)
+library(stargazer)
+library(lme4)
+library(kableExtra)
+library(mixedup)
+knitr::opts_chunk$set(echo = F)
+options(warn=-1)
+```
+
+```{python}
+#Use python to retrieve tables from LLAP server
+
+#Import required python packages
+import pandas as pd
+import sqlalchemy
+
+#connect to LLAP server
+engine_llap = sqlalchemy.create_engine("mssql+pyodbc:///?odbc_connect=Driver%3D%7BODBC+Driver+17+for+SQL+Server%7D%3BServer%3DISR-LLAP%3BDatabase%3DLibraryLogs%3Buid%3DISR%5C%2Ausername%2A%3Bpwd%3D%2Apassword%2A%3BTrusted_Connection%3Dyes%3B", fast_executemany = True)
+conn_llap = engine_llap.connect()
+
+#Get student grade records
+df_student_grades = pd.read_sql("Select UM_UNQNM, ACAD_LVL_BOT_SHORT_DES, CURR_GPA, CUM_GPA, PRMRY_CRER_DES, TERM_SHORT_DES from STDNT_TERM_INFO where CRER_LVL_CD = 'U'", conn_llap)
+
+#Get ezproxy counts
+df_ezproxy_counts = pd.read_sql("Select * from ezproxy_session_counts_by_term", conn_llap)
+
+#Get demographic records
+df_demos = pd.read_sql("Select UM_UNQNM, STDNT_GNDR_SHORT_DES, STDNT_ETHNC_GRP_SHORT_DES, PRNT_MAX_ED_LVL_DES, EST_GROSS_FAM_INC_DES, HS_GPA from STDNT_INFO", conn_llap)
+
+#Get list of freshman
+df_freshman = pd.read_sql("Select UM_UNQNM from STDNT_TERM_INFO where ENTRY_TYP_SHORT_DES = 'Freshman' and TERM_SHORT_DES = 'FA 2016'", conn_llap)
+```
+
+```{r}
+#Load data from python to R
+df_freshman = py$df_freshman
+df_ezproxy_counts = py$df_ezproxy_counts
+df_demos = py$df_demos
+df_student_grades = py$df_student_grades
+
+#Convert LARC UM_UNQNM variable to lowercase username to merge with ezproxy_counts
+df_freshman$username = tolower(df_freshman$UM_UNQNM)
+df_freshman = df_freshman %>% select(-UM_UNQNM)
+df_student_grades$username = tolower(df_student_grades$UM_UNQNM)
+df_student_grades = df_student_grades %>% select(-UM_UNQNM)
+df_demos$username = tolower(df_demos$UM_UNQNM)
+df_demos = df_demos %>% select(-UM_UNQNM)
+
+#Academic terms for which we have full grade records and ezproxy logs for full semester
+keep_terms = c("FA 2016", "WN 2017", "FA 2017", "WN 2018", "FA 2018", "WN 2019")
+
+#Filter terms for which we have full records
+df_student_grades = df_student_grades %>% filter(TERM_SHORT_DES %in% keep_terms)
+
+#Convert Term string into date so it observations can be ordered by time
+df_student_grades$term_date = gsub("FA ", "09/01/", df_student_grades$TERM_SHORT_DES)
+df_student_grades$term_date = gsub("WN ", "01/01/", df_student_grades$term_date)
+df_student_grades$term_date = as.Date(df_student_grades$term_date, format = '%m/%d/%Y')
+
+#Merge ezproxy counts with student grades on username and TERM_SHORT_DES
+df_student_grades = merge(df_student_grades, df_ezproxy_counts, by = c("username", "TERM_SHORT_DES"), all.x = T)
+df_student_grades = merge(df_student_grades, df_demos, by = "username", all.x = T)
+df_student_grades$count_ezproxy_session = na.fill(df_student_grades$count_ezproxy_session, 0)
+
+#create indicator for indepdendent variable of interest, ever using ezproxy session
+df_student_grades$ever_use_ezproxy = df_student_grades$count_ezproxy_session > 0
+
+#Create gender variable as factor from LARc STDNT_GNDR_SHORT_DES
+df_student_grades$gender = as.factor(df_student_grades$STDNT_GNDR_SHORT_DES)
+
+#Create collapsed race variable from LARC STDNT_ETHNC_GRP_SHORT_DES
+df_student_grades$race_recode = df_student_grades$STDNT_ETHNC_GRP_SHORT_DES
+df_student_grades$race_recode[df_student_grades$race_recode %in% c("Hawaiian", "Native Amr")] = "Other"
+df_student_grades$race_recode[is.na(df_student_grades$race_recode)] = "Not Indic"
+
+#Set reference level to White
+df_student_grades$race_recode = relevel(as.factor(df_student_grades$race_recode), "White")
+
+#Create first generation student indicator from LARC PRNT_MAX_ED_LVL_DES
+df_student_grades$parents_ed = as.character(df_student_grades$PRNT_MAX_ED_LVL_DES)
+df_student_grades$parents_ed[df_student_grades$parents_ed %in% c(' ', 'NA', 'NULL')] = NA
+df_student_grades$parent_no_deg = df_student_grades$parents_ed %in% c("Associate's degree", 
+                                                                  "Elementary School only",
+                                                                  "High School diploma",
+                                                                  "Less than High School",
+                                                                  "Some College")
+df_student_grades$first_gen = "Not First Gen"
+df_student_grades[df_student_grades$parent_no_deg,]$first_gen = "First Gen"
+df_student_grades$first_gen[df_student_grades$parents_ed == "Don't Know"] = "Don't Know"
+df_student_grades$first_gen = as.factor(df_student_grades$first_gen)
+
+#Set Not First Gen to reference group
+df_student_grades$first_gen = relevel(df_student_grades$first_gen, ref = "Not First Gen")
+
+#Create family income variable from EST_GROSS_FAM_INC_DES. Note that reporting categories changed over time
+# and we need to collapse values over $100,000 to one variable
+df_student_grades$fam_income = as.character(df_student_grades$EST_GROSS_FAM_INC_DES)
+df_student_grades$fam_income[df_student_grades$fam_income %in% c(' ', "NA", "NULL")] = "Missing Income Information"
+df_student_grades$fam_income[df_student_grades$fam_income %in% c("$100,000 - $149,999", "$150,000 - $199,999", "More than $200,000")] = "More than $100,000"
+
+#Set levels of factor, with More than $100,000 as reference
+df_student_grades$fam_income = factor(df_student_grades$fam_income, levels = c("More than $100,000",
+                                                                                "Less than $25,000", 
+                                                                               "$25,000 - $49,999",
+                                                                               "$50,000 - $74,999",
+                                                                               "$75,000 - $99,999",
+                                                                               "Don't Know",
+                                                                               "Missing Income Information"))
+
+#Create school variable with Undergraduate L S & A as reference level
+df_student_grades$school = relevel(as.factor(df_student_grades$PRMRY_CRER_DES), "Undergraduate L S & A")
+df_student_grades$school = droplevels(df_student_grades$school)
+
+#Create class_level variable with Freshman as reference
+df_student_grades$class_level = factor(df_student_grades$ACAD_LVL_BOT_SHORT_DES, levels = c("Freshman",
+                                                                                            "Sophomore",
+                                                                                            "Junior",
+                                                                                            "Senior",
+                                                                                            "USpec/NCFD"))
+
+#Create is_freshman_fa_2016 indicator by checking whether username of grades record is in vector of Freshman usernames from 2016
+df_student_grades$is_freshman_fa_2016 = df_student_grades$username %in% df_freshman$username
+
+#Filter missing High School GPA
+df_student_grades= df_student_grades %>% filter(!is.na(HS_GPA))
+
+#Remove LARC PRMRY_CRER_DES categories as recommended by Steve Lonn
+df_student_grades = df_student_grades %>% filter(!PRMRY_CRER_DES %in% c('Academic Outreach', 'Undergraduate Medicine', 'Undergraduate Non-Degree', 'Pharmacy Professional'))
+
+#Remove unspecified class level as recommended by Steve Lonn
+df_student_grades = df_student_grades %>% filter(class_level != 'USpec/NCFD')
+
+#Reset factor levels
+df_student_grades$class_level = factor(df_student_grades$class_level)
+
+#Add count of number of semesters student is observed to dataframe
+df_student_grades = df_student_grades %>% group_by(username) %>% add_tally()
+```
+
+```{r}
+
+#Set number of minimum semesters observed to 5
+semester = 5
+
+#Linear mixed effect model regressing on current GPA with username and school random intercepts for all students
+ever_use_linear_mixed_curr = lmer(CURR_GPA ~ ever_use_ezproxy + first_gen + fam_income +class_level +race_recode +gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(n >= semester))
+
+#Linear mixed effect model regressing on cumulative GPA with username and school random intercepts for all students
+ever_use_linear_mixed_cumm = lmer(CUM_GPA ~ ever_use_ezproxy + first_gen + fam_income +class_level +race_recode +gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(n >= semester))
+
+#Linear mixed effect model regressing on current GPA with username and school random intercepts for Fall 2016 Freshman
+ever_use_linear_mixed_curr_2016_cohort =lmer(CURR_GPA ~ ever_use_ezproxy + first_gen + fam_income +class_level +race_recode +gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(is_freshman_fa_2016 & n >= semester))
+
+#Linear mixed effect model regressing on cumulative GPA with username and school random intercepts for Fall 2016 Freshman
+ever_use_linear_mixed_cumm_2016_cohort =lmer(CUM_GPA ~ ever_use_ezproxy + first_gen + fam_income + class_level + race_recode + gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(is_freshman_fa_2016 & n >= semester))
+```
+
+# Linear Mixed Effects with Undergraduate Joined Degree Program
+
+Observations are at the student-term level with students observed in up to 6 terms: FA 2016, WN 2017, FA 2017, WN 2018, FA 2018, WN 2019. All models are restricted to undergraduate students that are observed in `r semester` or more semesters. All models include student and school random effects. We drop all observations that are missing HS GPA or are enrolled in non-undergraduate programs including Academic Outreach, Undergraduate Medicine, Undergraduate Non-Degree, and Pharmacy Professional. Our key independent variable of interest, EZProxy use in a given term, measures whether a student was associated with one or more EZProxy sessions at any time during an academic term. Term start and end dates are defined by using the University of Michigan Registrar’s Academic Calendar.
+
+```{r, results = 'asis'}
+#Set labels for stargazer table
+covar_labels = c("Ever Use EZProxy in Term", 
+                 "Don't Know Whether First Gen", 
+                 "First Gen", 
+                 "Less than $25,000",
+                 "$25,000-$49,999",
+                 "$50,000-$74,999",
+                 "$75,000-$99,999",
+                 "Don't Know Family Income",
+                 "Family Income Info Missing",
+                 "Sophomore",
+                 "Junior",
+                 "Senior",
+                 "2 or More Races",
+                 "Asian",
+                 "Black",
+                 "Hispanic",
+                 "Race Not Indicated",
+                 "Other Race",
+                 "Male",
+                 "HS GPA",
+                 "Intercept")
+
+#Create stargazer table
+stargazer(ever_use_linear_mixed_curr, ever_use_linear_mixed_cumm, ever_use_linear_mixed_curr_2016_cohort, ever_use_linear_mixed_cumm_2016_cohort, covariate.labels = covar_labels, header = F, dep.var.labels = c("Semester GPA", "Cumulative GPA", "Semester GPA", "Cumulative GPA"), title = "Linear Mixed Effects Regressions on GPA, FA 2016 - WN 2019", add.lines = list(c("Cohort", "All Undergrads", "All Undergrads", "2016 Freshman", "2016 Freshman")), type = 'html', omit.stat = c("aic", "bic", "ll"))
+```
+
+
+Below are the random school intercepts for these models.
+
+
+```{r}
+intercepts_mixed_curr = extract_random_effects(ever_use_linear_mixed_curr) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+intercepts_mixed_cumm = extract_random_effects(ever_use_linear_mixed_cumm) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+intercepts_mixed_curr_2016 = extract_random_effects(ever_use_linear_mixed_curr_2016_cohort) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+intercepts_mixed_cumm_2016 = extract_random_effects(ever_use_linear_mixed_cumm_2016_cohort) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+```
+
+All Undergrads, Current GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_curr) %>% kable_styling()
+```
+
+All Undergrads, Cumulative GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_cumm) %>% kable_styling()
+```
+
+FA 2016 Freshman, Current GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_curr_2016) %>% kable_styling()
+```
+
+FA 2016 Freshman, Cumulative GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_cumm_2016) %>% kable_styling()
+```
+
+
+```{r}
+#Convergence 
+#Set number of minimum semesters observed to 4
+semester = 4
+
+#Linear mixed effect model regressing on current GPA with username and school random intercepts for all students
+ever_use_linear_mixed_curr = lmer(CURR_GPA ~ ever_use_ezproxy + first_gen + fam_income +class_level +race_recode +gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(n >= semester & PRMRY_CRER_DES != 'Undergraduate Joined Deg Prog'))
+
+#Linear mixed effect model regressing on cumulative GPA with username and school random intercepts for all students
+ever_use_linear_mixed_cumm = lmer(CUM_GPA ~ ever_use_ezproxy + first_gen + fam_income +class_level +race_recode +gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(n >= semester & PRMRY_CRER_DES != 'Undergraduate Joined Deg Prog'))
+
+#Linear mixed effect model regressing on current GPA with username and school random intercepts for Fall 2016 Freshman
+ever_use_linear_mixed_curr_2016_cohort =lmer(CURR_GPA ~ ever_use_ezproxy + first_gen + fam_income +class_level +race_recode +gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(is_freshman_fa_2016 & n >= semester & PRMRY_CRER_DES != 'Undergraduate Joined Deg Prog'))
+ 
+#Linear mixed effect model regressing on cumulative GPA with username and school random intercepts for Fall 2016 Freshman
+ever_use_linear_mixed_cumm_2016_cohort =lmer(CUM_GPA ~ ever_use_ezproxy + first_gen + fam_income + class_level + race_recode + gender + HS_GPA + (1|username) + (1|school), data = df_student_grades %>% filter(is_freshman_fa_2016 & n >= semester & PRMRY_CRER_DES != 'Undergraduate Joined Deg Prog'))
+```
+
+# Linear Mixed Effects without Undergraduate Joined Degree Program
+
+Observations are at the student-term level with students observed in up to 6 terms: FA 2016, WN 2017, FA 2017, WN 2018, FA 2018, WN 2019. All models are restricted to undergraduate students that are observed in `r semester` or more semesters. All models include student and school random effects. We drop all observations that are missing HS GPA or are enrolled in non-undergraduate programs including Academic Outreach, Undergraduate Medicine, Undergraduate Non-Degree, and Pharmacy Professional. In addition, we drop the limited number of students enrolled in Undergraduate Joined Degree Programs. Our key independent variable of interest, EZProxy use in a given term, measures whether a student was associated with one or more EZProxy sessions at any time during an academic term. Term start and end dates are defined by using the University of Michigan Registrar’s Academic Calendar.
+
+```{r, results = 'asis'}
+
+#Create labels for stargazer table
+covar_labels = c("Ever Use EZProxy in Term", 
+                 "Don't Know Whether First Gen", 
+                 "First Gen", 
+                 "Less than $25,000",
+                 "$25,000-$49,999",
+                 "$50,000-$74,999",
+                 "$75,000-$99,999",
+                 "Don't Know Family Income",
+                 "Family Income Info Missing",
+                 "Sophomore",
+                 "Junior",
+                 "Senior",
+                 "2 or More Races",
+                 "Asian",
+                 "Black",
+                 "Hispanic",
+                 "Race Not Indicated",
+                 "Other Race",
+                 "Male",
+                 "HS GPA",
+                 "Intercept")
+
+#Create stargazer table
+stargazer(ever_use_linear_mixed_curr, ever_use_linear_mixed_cumm, ever_use_linear_mixed_curr_2016_cohort, ever_use_linear_mixed_cumm_2016_cohort, covariate.labels = covar_labels, header = F, dep.var.labels = c("Semester GPA", "Cumulative GPA", "Semester GPA", "Cumulative GPA"), title = "Linear Mixed Effects Regressions on GPA, FA 2016 - WN 2019", add.lines = list(c("Cohort", "All Undergrads", "All Undergrads", "2016 Freshman", "2016 Freshman")), type = 'html', omit.stat = c("aic", "bic", "ll"))
+```
+
+Below are the random school intercepts for these models.
+
+
+```{r}
+intercepts_mixed_curr = extract_random_effects(ever_use_linear_mixed_curr) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+intercepts_mixed_cumm = extract_random_effects(ever_use_linear_mixed_cumm) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+intercepts_mixed_curr_2016 = extract_random_effects(ever_use_linear_mixed_curr_2016_cohort) %>% filter(group_var == "school") %>% select(-group_var, -effect)
+intercepts_mixed_cumm_2016 = extract_random_effects(ever_use_linear_mixed_cumm_2016_cohort) %>% filter(group_var == "school")%>% select(-group_var, -effect)
+```
+
+All Undergrads, Current GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_curr) %>% kable_styling()
+```
+
+All Undergrads, Cumulative GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_cumm) %>% kable_styling()
+```
+
+FA 2016 Freshman, Current GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_curr_2016) %>% kable_styling()
+```
+
+FA 2016 Freshman, Cumulative GPA:
+
+```{r}
+#Print out html table of random intercepts
+kable(intercepts_mixed_cumm_2016) %>% kable_styling()
+```
